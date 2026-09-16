@@ -170,6 +170,11 @@ class OverlayApp:
         self.cards: dict[str, Gtk.Box] = {}
         self._shown: list[str] = []
         self.history = True
+        # Floor for the panel height so a card never shrinks when its text is
+        # replaced by something shorter (e.g. two-tier refine replaces a long
+        # streaming draft with a shorter offline transcript). Resets only when
+        # the last card is cleared.
+        self._min_scroll_height = 0
 
         self.window.connect("map", lambda *_: self._relayout())
 
@@ -205,14 +210,26 @@ class OverlayApp:
         return None
 
     def _relayout(self) -> None:
-        """Cap the panel at the monitor height so content scrolls instead of
-        overflowing the screen. The ScrolledWindow reports its natural height
-        as min(content, max), so the window grows with content up to the cap."""
+        """Size the panel to its content, capped at the monitor height.
+
+        The ScrolledWindow does not reliably propagate its child's natural
+        height to the layer-shell window (and in-place label updates don't
+        queue a resize), so measure the entries box synchronously at the
+        content width and pin the scrolled window to that height (capped).
+        Content scrolls only once it hits the cap.
+        """
         size = self._monitor_size()
         if size is None:
             return
         max_h = max(120, size[1] - 48)
         self.scroll.set_max_content_height(max_h)
+        width = self.window.get_width()
+        if width <= 0:
+            width = 420
+        for_size = max(0, width - 24)  # card padding + gradient border
+        _, nat, _, _ = self.entries.measure(Gtk.Orientation.VERTICAL, for_size)
+        self._min_scroll_height = max(self._min_scroll_height, min(nat, max_h))
+        self.scroll.set_size_request(-1, max(self._min_scroll_height, min(nat, max_h)))
         # Newest is prepended at the top; keep it visible.
         adj = self.scroll.get_vadjustment()
         GLib.idle_add(adj.set_value, 0)
@@ -335,6 +352,7 @@ class OverlayApp:
                 self.entries.remove(entry)
         self.cards.clear()
         self._shown = []
+        self._min_scroll_height = 0
         self._update_visibility()
 
     def set_history(self, enabled: bool):
