@@ -2,6 +2,20 @@
 
 ## Handoff Status
 
+Latest (2026-09-16 12:35): fixed-WAV fresh-WebSocket ABBA completed in order
+A-B-B-A, where A sent immediately after `session.updated` and B first proved
+inference with the deployed 1.6s tone + 1.6s silence warmup, then cleared and
+awaited `input_audio_buffer.cleared`. All four runs sent identical PCM from
+`in-85` (17.52s; PCM SHA-256 `2e89e5482a80b391c110a48890d29df206bb2958cde6857a6f8df54bba0c0d1d`)
+in paced 160ms frames plus 2.56s trailing silence. A first-delta latencies were
+4.421s/4.419s (mean 4.420s); B were 4.426s/4.419s (mean 4.423s). A final mean
+was 18.974s versus B 18.951s. Every run produced the same transcript opening,
+the same `audio_processed` 18.96s, exactly one final, and no errors or aborts;
+controller PID 1817452, NeMo PID 1817460, and NRestarts=0 remained stable.
+Therefore per-socket warmup has no material effect and does not explain the
+natural first-play delay. Raw plan, summary, and events:
+`/tmp/opencode/fresh-ws-abba-20260916-123310/`.
+
 Latest (2026-09-16 11:42): complete tested/deployed reliability change set was
 committed as `6015fd2` (`Reset streaming ASR state safely after finals`) and
 pushed to `origin/main`; local `main` and GitHub are synchronized (`0/0`). Full

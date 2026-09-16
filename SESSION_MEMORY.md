@@ -145,6 +145,18 @@ Offline bilingual (en↔es) live speech-translation plugin for Omarchy Linux
     a fresh `incoming started` with the current gen.
 
 ## Current investigation / next up (user's priority, 2026-09-15)
+- **Fixed-WAV fresh-WebSocket ABBA completed, 2026-09-16 12:35:** order A-B-B-A.
+  A sent after `session.updated`; B ran the deployed 1.6s tone + 1.6s silence
+  warmup, observed inference proof, then clear acknowledgement before speech.
+  All trials sent identical paced 160ms PCM from `in-85` (17.52s, PCM SHA-256
+  `2e89e5482a80b391c110a48890d29df206bb2958cde6857a6f8df54bba0c0d1d`)
+  plus 2.56s trailing silence. First delta: A 4.421/4.419s (mean4.420), B
+  4.426/4.419s (mean4.423). Final mean: A18.974s, B18.951s. Transcript opening
+  and complete final were identical in all four; audio_processed18.96s; exactly
+  one final each; no errors/aborts. Controller PID1817452, NeMo PID1817460, and
+  NRestarts0 stayed stable. Conclusion: per-socket proven warmup has no material
+  effect and does not explain natural first-play latency. Evidence:
+  `/tmp/opencode/fresh-ws-abba-20260916-123310/`.
 - **GitHub synchronized, 2026-09-16 11:42:** committed the complete tested and
   deployed reliability change set as `6015fd2` (`Reset streaming ASR state
   safely after finals`) and pushed `main` to `origin/main`; ahead/behind is
