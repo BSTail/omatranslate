@@ -145,6 +145,13 @@ Offline bilingual (en↔es) live speech-translation plugin for Omarchy Linux
     a fresh `incoming started` with the current gen.
 
 ## Current investigation / next up (user's priority, 2026-09-15)
+- **GitHub synchronized, 2026-09-16 11:42:** committed the complete tested and
+  deployed reliability change set as `6015fd2` (`Reset streaming ASR state
+  safely after finals`) and pushed `main` to `origin/main`; ahead/behind is
+  `0/0`. Full suite:46 passed; diff-check clean. Repo/deployed
+  `audio.py`/`controller.py`/`nemo.py` match. Service remains active since
+  03:41:18 with `NRestarts=0`. `sox`/`soxi` are installed. Next optional test:
+  fixed-WAV fresh-WebSocket ABBA, unprimed versus current proven warmup.
 - **Post-final reset production validation passed, 2026-09-16 11:19:** user
   replayed audio seven times (`in-85`..`in-91`). Every gate produced draft,
   final, translation, and one clear request/sent/ack; all acks preceded the next

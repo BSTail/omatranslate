@@ -2,6 +2,13 @@
 
 ## Handoff Status
 
+Latest (2026-09-16 11:42): complete tested/deployed reliability change set was
+committed as `6015fd2` (`Reset streaming ASR state safely after finals`) and
+pushed to `origin/main`; local `main` and GitHub are synchronized (`0/0`). Full
+suite remains 46 passing and diff-check clean. Repo/deployed
+`audio.py`/`controller.py`/`nemo.py` match; service active since 03:41:18 with
+`NRestarts=0`. `sox`/`soxi` are installed for the next audio experiment.
+
 Latest (2026-09-16 11:19): first post-fix production replay is successful.
 Seven consecutive gates (`in-85` through `in-91`) all produced drafts, finals,
 translations, and exactly one safe clear request/send/ack cycle. Gate-to-first-
