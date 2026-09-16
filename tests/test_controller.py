@@ -201,7 +201,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(call.args[6], call.args[7])
         self.assertLessEqual(calls[0].args[7], calls[1].args[6])
 
-    async def test_watchdog_remembers_deltas_across_final(self):
+    async def test_delayed_asr_after_final_warns_once_without_losing_stream(self):
         final_seen = asyncio.Event()
         reads = 0
         self.c.cfg.incoming.gate_close_ms = 160
@@ -218,11 +218,19 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             yield {'type': 'conversation.item.input_audio_transcription.delta', 'delta': 'hello'}
             yield {'type': 'conversation.item.input_audio_transcription.completed', 'transcript': 'hello'}
             final_seen.set()
-            await closed.wait()
-        with patch('olt.controller._STALL_WATCHDOG_S', 0):
+            await asyncio.sleep(0.35)
+            self.assertFalse(closed.is_set())
+            self.assertIn(pcm(500), [call.args[0] for call in stream.send_audio.call_args_list])
+            yield {'type': 'conversation.item.input_audio_transcription.delta', 'delta': 'Te amo'}
+            yield {'type': 'conversation.item.input_audio_transcription.completed', 'transcript': 'Te amo'}
+            await asyncio.sleep(0)
+        with patch('olt.controller._ASR_DELAY_WARNING_S', 0), \
+                patch('olt.controller.log.warning') as warning:
             await self.run_stream(read_chunk, events, gated=True)
+        warning.assert_called_once()
+        self.assertEqual(self.c._finalize_incoming.call_args.args[1], 'Te amo')
 
-    async def test_watchdog_spares_cold_stream_and_disarms_on_delta(self):
+    async def test_delay_monitor_spares_cold_stream_and_disarms_on_delta(self):
         for cold in (True, False):
             with self.subTest(cold=cold):
                 ready = asyncio.Event()
@@ -247,8 +255,10 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                         yield {'type': 'conversation.item.input_audio_transcription.delta', 'delta': 'second'}
                     await asyncio.sleep(0.15)
                     self.assertFalse(closed.is_set())
-                with patch('olt.controller._STALL_WATCHDOG_S', 0):
+                with patch('olt.controller._ASR_DELAY_WARNING_S', 0), \
+                        patch('olt.controller.log.warning') as warning:
                     await self.run_stream(read_chunk, events, gated=True)
+                self.assertEqual(warning.call_count, 1 if cold else 0)
 
     async def test_incoming_reconnects_after_session_exit(self):
         self.c._incoming_once = AsyncMock(side_effect=[None, asyncio.CancelledError()])

@@ -25,12 +25,10 @@ from .config import Config, load
 
 log = logging.get()
 
-# (b)-lite stall watchdog: after the gate re-opens on speech, if the server
-# emits no delta within this window while the gate is still open, the stream is
-# wedged and we recycle the session. A full second is safe against slow first
-# inference; a genuinely wedged stream emits nothing ever, so the extra time
-# only costs a slightly later recycle.
-_STALL_WATCHDOG_S = 1.0
+# Diagnostic only: observed legitimate first-delta latency exceeds 11 seconds.
+# A timeout cannot prove a wedge. Recovery needs continuous capture and complete
+# replay before it can safely replace a stream that has accepted speech.
+_ASR_DELAY_WARNING_S = 15.0
 
 
 class SilenceGate:
@@ -675,15 +673,10 @@ class Controller:
         # `ring_base` = bytes already trimmed off the front; a stored utterance
         # offset is absolute (ring_base + index) and converted back on snapshot.
         ring_base = 0
-        # Stall-watchdog state: when the gate re-opens on speech we arm a
-        # deadline; if no delta arrives before it (while still open) the stream
-        # is wedged (the upstream zero-PCM bug) and we recycle the session.
-        # The watchdog only arms once the stream has already produced at least
-        # one delta (`onset_delta_count > 0`): the *first* delta after a fresh
-        # stream can legitimately take a while (cold encoder), so it must never
-        # trip the recycle.
+        # Report delayed ASR once per onset without discarding accepted audio.
         onset_mono: float | None = None
         onset_delta_count = 0
+        onset_warned = False
         # Silence gate is only meaningful in multimedia mode (continuous media
         # audio). In live-call mode audio flows unfiltered.
         gate = None
@@ -701,7 +694,7 @@ class Controller:
         try:
             async def pump():
                 nonlocal captured_bytes, ring_base
-                nonlocal onset_mono, onset_delta_count
+                nonlocal onset_mono, onset_delta_count, onset_warned
                 try:
                     while True:
                         chunk = await cap.read_chunk(self.cfg.chunk_ms)
@@ -713,6 +706,7 @@ class Controller:
                             if not was_open and gate.open:
                                 onset_mono = time.monotonic()
                                 onset_delta_count = stream_delta_count
+                                onset_warned = False
                                 log.info(
                                     "gate opened (stream %.2fs, preroll+chunk %d bytes, monotonic %.6f)",
                                     captured_bytes / (audio.RATE * 2), len(chunk), onset_mono,
@@ -746,32 +740,28 @@ class Controller:
                     # so incoming() can reconnect instead of waiting forever.
                     await stream.close()
 
-            async def stall_watchdog():
-                # Recycle the session if speech has been flowing (gate open)
-                # since a re-open with no delta arriving. Closing the stream
-                # ends `stream.events()` and lets `_incoming_once` return, which
-                # makes the outer `incoming()` loop reconnect on a fresh session.
+            async def monitor_asr_delay():
+                nonlocal onset_warned
                 while True:
                     await asyncio.sleep(0.1)
                     if (
                         gate is not None
                         and gate.open
                         and onset_mono is not None
-                        and onset_delta_count > 0
+                        and not onset_warned
                         and stream_delta_count == onset_delta_count
-                        and (time.monotonic() - onset_mono) > _STALL_WATCHDOG_S
+                        and (time.monotonic() - onset_mono) > _ASR_DELAY_WARNING_S
                     ):
                         log.warning(
-                            "stall watchdog: gate open %.0fms with no deltas; "
-                            "recycling stream session",
+                            "ASR delayed: gate open %.0fms with no deltas; "
+                            "keeping stream open to preserve speech",
                             (time.monotonic() - onset_mono) * 1000,
                         )
-                        await stream.close()
-                        return
+                        onset_warned = True
 
             pump_task = asyncio.create_task(pump())
-            watchdog_task = (
-                asyncio.create_task(stall_watchdog()) if gate is not None else None
+            delay_task = (
+                asyncio.create_task(monitor_asr_delay()) if gate is not None else None
             )
             try:
                 async for ev in stream.events():
@@ -843,9 +833,9 @@ class Controller:
                     "incoming stream ended (gen %d, deltas %d, other events %s)",
                     gen, delta_count, other_events or "{}",
                 )
-                if watchdog_task is not None:
-                    watchdog_task.cancel()
-                    await asyncio.gather(watchdog_task, return_exceptions=True)
+                if delay_task is not None:
+                    delay_task.cancel()
+                    await asyncio.gather(delay_task, return_exceptions=True)
                 pump_task.cancel()
                 try:
                     await pump_task

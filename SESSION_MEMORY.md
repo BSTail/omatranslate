@@ -145,6 +145,25 @@ Offline bilingual (en↔es) live speech-translation plugin for Omarchy Linux
     a fresh `incoming started` with the current gen.
 
 ## Current investigation / next up (user's priority, 2026-09-15)
+- **Watchdog safety correction (2026-09-16, deployed at 00:30):** removed automatic
+  stream closure on missing deltas. A diagnostic monitor now warns after 15s,
+  once per gate onset, without interrupting capture/ASR. Delayed post-final and
+  cold-stream tests pass; all 29 tests pass. EOF/socket-error reconnect and
+  wire-silent idle remain unchanged. Service startup verified; speech replay
+  not yet live-verified. Independent static review found no actionable issues. This
+  disables no-delta recovery rather than claiming safe replay is implemented;
+  truly wedged connections need future continuous-capture, complete-replay
+  recovery with duplicate-output handling. Next: live-check and compare
+  captured onset audio against ASR output for the independent missing words.
+- **Capture investigation:** events confirm the first final starts "Para que"
+  and the successful later final starts "Te amo"; identical playback starting
+  positions are not established. Debug WAVs are post-cleanup, pre-gate, and may
+  be silence-trimmed on close without renaming, so filename plus sample offset
+  is not a reliable wall-clock mapping. Finals do not roll the current capture
+  (supersedes the older general debug-WAV note above). Gate buffers only
+  consecutive above-threshold chunks while closed, not continuous preroll;
+  soft onset loss is possible but not proven for this recording. Next controlled
+  comparison should retain exact sent PCM and all ASR events.
 - **Live verification 2026-09-16:** changes are deployed, service active;
   publication of the tested changes and checklist requested by the user.
   User confirms correct panel size, no visual clipping, and
