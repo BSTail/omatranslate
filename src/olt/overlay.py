@@ -22,7 +22,9 @@ colors. If no Omarchy theme is found it falls back to GTK named colors.
 from __future__ import annotations
 
 import json
+import os
 import sys
+import time
 
 import gi
 
@@ -167,9 +169,10 @@ class OverlayApp:
         self.border.append(self.card_box)
         self.window.set_child(self.border)
 
-        self.cards: dict[str, Gtk.Box] = {}
+        self.cards: dict[str, tuple[Gtk.Box, Gtk.Label, Gtk.Label]] = {}
         self._shown: list[str] = []
         self.history = True
+        self._stdin_buffer = bytearray()
         # Floor for the panel height so a card never shrinks when its text is
         # replaced by something shorter (e.g. two-tier refine replaces a long
         # streaming draft with a shorter offline transcript). Resets only when
@@ -241,28 +244,22 @@ class OverlayApp:
         hidden in place: hiding a child inside a GtkScrolledWindow's viewport
         triggers `gtk_widget_is_ancestor` assertions, so we detach instead.
         """
-        if self.history:
-            self.scroll.set_visible(True)
-            # Re-attach every card in order (newest first).
-            for card_id in reversed(self._shown):
-                item = self.cards.get(card_id)
-                if item is not None and item[0].get_parent() is None:
-                    self.entries.prepend(item[0])
-            self._shown = list(self.cards.keys())
-            self._relayout()
-            return
-        # Newest-only: keep just the most recent entry attached.
-        newest_id = self._shown[0] if self._shown else None
-        for card_id in list(self._shown):
-            item = self.cards.get(card_id)
-            if item is None:
-                continue
-            if card_id == newest_id:
-                continue
-            if item[0].get_parent() is not None:
-                self.entries.remove(item[0])
-        self._shown = [newest_id] if newest_id else []
-        self.scroll.set_visible(False)
+        # Dict insertion order records creation order, not delta arrival order.
+        shown = list(reversed(self.cards))
+        if not self.history:
+            shown = shown[:1]
+        wanted = set(shown)
+        for card_id in self._shown:
+            if card_id not in wanted:
+                self.entries.remove(self.cards[card_id][0])
+        previous = None
+        for card_id in shown:
+            entry = self.cards[card_id][0]
+            if entry.get_parent() is None:
+                self.entries.insert_child_after(entry, previous)
+            previous = entry
+        self._shown = shown
+        self.scroll.set_visible(True)
         self._relayout()
 
     def _update_visibility(self) -> None:
@@ -298,8 +295,6 @@ class OverlayApp:
                 bottom_label.set_text(source)
                 top_label.set_css_classes([state_class])
                 bottom_label.set_css_classes(["olt-src"])
-            self._shown.remove(card_id)
-            self._shown.insert(0, card_id)
             self._update_visibility()
             # Mutating label text in place does not queue a resize, so the
             # window keeps its old height and clips the new content. Queue the
@@ -322,15 +317,9 @@ class OverlayApp:
         entry.append(top_label)
         entry.append(bottom_label)
 
-        if self.history:
-            self.entries.prepend(entry)
         self.cards[card_id] = (entry, top_label, bottom_label)
-        self._shown.insert(0, card_id)
+        self._apply_history()
         self._update_visibility()
-        if not self.history:
-            self._apply_history()
-        else:
-            self._relayout()
 
     def state(self, card_id: str, state: str):
         pass
@@ -343,6 +332,10 @@ class OverlayApp:
                 self.entries.remove(entry)
         if card_id in self._shown:
             self._shown.remove(card_id)
+        if not self.cards:
+            self._min_scroll_height = 0
+            self.scroll.set_size_request(-1, 0)
+        self._apply_history()
         self._update_visibility()
 
     def clear_all(self):
@@ -353,6 +346,7 @@ class OverlayApp:
         self.cards.clear()
         self._shown = []
         self._min_scroll_height = 0
+        self.scroll.set_size_request(-1, 0)
         self._update_visibility()
 
     def set_history(self, enabled: bool):
@@ -374,8 +368,17 @@ class OverlayApp:
             msg = json.loads(line)
         except json.JSONDecodeError:
             return
+        if not isinstance(msg, dict):
+            return
         cmd = msg.get("cmd")
         if cmd == "card":
+            if msg.get("id", "?") not in self.cards:
+                print(
+                    f"olt-overlay: first card received id={msg.get('id', '?')} "
+                    f"monotonic={time.monotonic():.6f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self.card(
                 msg.get("id", "?"),
                 msg.get("direction", "out"),
@@ -393,17 +396,47 @@ class OverlayApp:
             self.hint(msg.get("text", ""))
 
     def run(self):
-        GLib.io_add_watch(sys.stdin, GLib.IO_IN, self._stdin_cb)
+        fd = sys.stdin.fileno()
+        os.set_blocking(fd, False)
+        GLib.io_add_watch(
+            fd, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._stdin_cb
+        )
         self.window.connect("destroy", lambda *_: self.loop.quit())
         self.loop = GLib.MainLoop()
         self.loop.run()
 
     def _stdin_cb(self, source, condition):
-        line = source.readline()
-        if not line:
-            return GLib.SOURCE_REMOVE
-        self.on_line(line)
-        return GLib.SOURCE_CONTINUE
+        # Never mix fd readiness with TextIOWrapper read-ahead. Frame bytes
+        # before decoding so even a split UTF-8 codepoint waits for its line.
+        eof = False
+        while True:
+            try:
+                chunk = os.read(source, 65536)
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                break
+            except OSError:
+                eof = True
+                break
+            if not chunk:
+                eof = True
+                break
+            self._stdin_buffer.extend(chunk)
+        lines = self._stdin_buffer.split(b"\n")
+        self._stdin_buffer = lines.pop()
+        if eof or condition & (GLib.IO_HUP | GLib.IO_ERR | GLib.IO_NVAL):
+            # Accept a final command without a newline, then retire the watch.
+            lines.append(self._stdin_buffer)
+            self._stdin_buffer = bytearray()
+            eof = True
+        for line in lines:
+            try:
+                text = line.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            self.on_line(text)
+        return GLib.SOURCE_REMOVE if eof else GLib.SOURCE_CONTINUE
 
 
 def main():

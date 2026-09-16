@@ -72,7 +72,7 @@ class SilenceGate:
         self._quiet_ms = 0.0
         self._trailing_left_ms = 0.0
         self._preroll: bytearray = bytearray()
-        self._preroll_cap = int(audio.RATE * 2 * preroll_ms / 1000)
+        self._preroll_cap = int(audio.RATE * self.preroll_ms / 1000) * 2
 
     @property
     def open(self) -> bool:
@@ -109,9 +109,6 @@ class SilenceGate:
         # Closed (or just closed): gate real speech as preroll.
         if rms > self.open_rms:
             self._loud_ms += chunk_ms
-            self._preroll.extend(chunk)
-            if len(self._preroll) > self._preroll_cap:
-                del self._preroll[: len(self._preroll) - self._preroll_cap]
             if self._loud_ms >= self.open_ms:
                 self._open = True
                 self._loud_ms = 0.0
@@ -123,8 +120,12 @@ class SilenceGate:
                     rms, self.open_rms, self.open_ms, len(preroll),
                 )
                 return preroll + chunk
+            self._preroll.extend(chunk)
+            if len(self._preroll) > self._preroll_cap:
+                del self._preroll[: len(self._preroll) - self._preroll_cap]
         else:
             self._loud_ms = 0.0
+            self._preroll.clear()
         # Still closed: bounded trailing silence, then wire silence.
         if self._trailing_left_ms > 0:
             self._trailing_left_ms = max(0.0, self._trailing_left_ms - chunk_ms)
@@ -172,6 +173,7 @@ class Controller:
             env=env,
         )
         self._overlay_stdin = self.overlay_proc.stdin
+        self.overlay_send({"cmd": "history", "enabled": self.cfg.overlay.history})
         asyncio.create_task(self._watch_overlay_stderr())
         log.info("overlay started (pid %s)", self.overlay_proc.pid)
 
@@ -658,31 +660,16 @@ class Controller:
         # First-play diagnostics: count deltas, time the first one, and tally
         # every other event type so a silent failure is attributable.
         delta_count = 0
+        stream_delta_count = 0
         first_delta_at: float | None = None
+        first_card_at: float | None = None
         other_events: dict[str, int] = {}
-        # Monotonic sample offsets. `cap.read_chunk` returns PCM16 frames of a
-        # fixed chunk size. We record how many sample bytes we've captured at
-        # the moment each final is emitted; combined with the server's
-        # `audio_processed` (stream-global seconds) this bounds the utterance's
-        # audio for offline re-transcription.
+        # Absolute positions count only PCM sent on this stream, including
+        # preroll and synthesized trailing silence, never wire-silent gaps.
         captured_bytes = 0
-        # Rolling ring of raw captured PCM16 (bytes). Offline re-transcription
-        # needs the *final* utterance's audio, which started before this final
-        # was emitted, so we keep a modest look-back. The server reports
-        # `audio_processed` (seconds) on each final; the difference between
-        # consecutive finals bounds the utterance length.
         lookback_ms = 20000
         self._incoming_ring = bytearray()
         ring_cap = int(audio.RATE * 2 * lookback_ms / 1000)
-        prev_processed_sec = 0.0
-        # Byte offsets (into `_incoming_ring`) bounding the current utterance.
-        # In gated mode these are set by the gate's open/close transitions so
-        # the offline snapshot contains exactly the speech (plus its trailing
-        # silence), NOT minutes of gated zero-PCM that preceded it. Without a
-        # gate (live-call mode) they stay 0 and the audio_processed delta is
-        # used instead.
-        utt_start = 0
-        utt_end = 0
         # Absolute stream byte positions: `_incoming_ring` is trimmed from the
         # front as it overflows, so offsets recorded as raw indices would shift.
         # `ring_base` = bytes already trimmed off the front; a stored utterance
@@ -713,7 +700,7 @@ class Controller:
             )
         try:
             async def pump():
-                nonlocal captured_bytes, utt_start, utt_end, ring_base
+                nonlocal captured_bytes, ring_base
                 nonlocal onset_mono, onset_delta_count
                 try:
                     while True:
@@ -724,20 +711,13 @@ class Controller:
                             was_open = gate.open
                             chunk = gate.process(chunk, self.cfg.chunk_ms)
                             if not was_open and gate.open:
-                                # Gate just opened: the utterance starts at the
-                                # preroll+chunk about to be appended.
-                                utt_start = ring_base + len(self._incoming_ring)
                                 onset_mono = time.monotonic()
-                                onset_delta_count = delta_count
+                                onset_delta_count = stream_delta_count
                                 log.info(
-                                    "gate opened (stream %.2fs, preroll+chunk %d bytes)",
-                                    captured_bytes / (audio.RATE * 2), len(chunk),
+                                    "gate opened (stream %.2fs, preroll+chunk %d bytes, monotonic %.6f)",
+                                    captured_bytes / (audio.RATE * 2), len(chunk), onset_mono,
                                 )
                             elif was_open and not gate.open:
-                                # Gate just closed: the utterance (incl. its
-                                # trailing silence) ends here, before the zero
-                                # chunk about to be appended.
-                                utt_end = ring_base + len(self._incoming_ring)
                                 onset_mono = None
                                 log.info(
                                     "gate closed (stream %.2fs)",
@@ -761,6 +741,10 @@ class Controller:
                     pass
                 except Exception as exc:
                     log.error("incoming pump error: %s", exc)
+                finally:
+                    # EOF and send/read failures must unblock the event reader
+                    # so incoming() can reconnect instead of waiting forever.
+                    await stream.close()
 
             async def stall_watchdog():
                 # Recycle the session if speech has been flowing (gate open)
@@ -774,7 +758,7 @@ class Controller:
                         and gate.open
                         and onset_mono is not None
                         and onset_delta_count > 0
-                        and delta_count == onset_delta_count
+                        and stream_delta_count == onset_delta_count
                         and (time.monotonic() - onset_mono) > _STALL_WATCHDOG_S
                     ):
                         log.warning(
@@ -794,36 +778,44 @@ class Controller:
                     t = ev.get("type")
                     if t == "conversation.item.input_audio_transcription.delta":
                         delta_count += 1
+                        stream_delta_count += 1
                         if first_delta_at is None:
-                            first_delta_at = time.monotonic() - t_capture_start
+                            first_delta_at = time.monotonic()
                         partial = (partial + ev.get("delta", "")).strip()
                         self.overlay_send(
                             {"cmd": "card", "id": card_id, "direction": "in",
                              "source": partial, "target": "", "state": "draft"}
                         )
+                        if first_card_at is None:
+                            first_card_at = time.monotonic()
+                            log.info(
+                                "incoming first draft %s: delta monotonic %.6f, sent %.6f",
+                                card_id, first_delta_at, first_card_at,
+                            )
                     elif t == "conversation.item.input_audio_transcription.completed":
                         final = ev.get("transcript", partial).strip()
                         t_asr_final = time.monotonic()
-                        this_processed = float(ev.get("audio_processed") or 0.0)
                         # Log every final (even empty) so a first-utterance
                         # empty `.completed` is visible instead of silently
                         # producing no card.
                         log.info(
-                            "incoming completed (gen %d, %d chars, audio_processed %.2fs, "
+                            "incoming completed (gen %d, %d chars, audio_processed %r, "
                             "deltas %d, first_delta %.3fs)",
-                            gen, len(final), this_processed,
-                            delta_count, first_delta_at if first_delta_at is not None else -1.0,
+                            gen, len(final), ev.get("audio_processed"),
+                            delta_count, first_delta_at - t_capture_start if first_delta_at is not None else -1.0,
                         )
                         utterance_audio = b""
                         if self.cfg.asr.offline_enabled:
+                            # NeMo CacheStreamRunner::step reports supplied
+                            # audio_end, including buffered future utterances.
+                            # The realtime protocol exposes no complete start/
+                            # end bounds. Neither that high-water mark nor gate
+                            # transitions safely identify a particular final.
                             utterance_audio = self._snapshot_utterance_audio(
-                                this_processed, prev_processed_sec,
-                                utt_start, utt_end, ring_base,
+                                None, None, ring_base,
                             )
-                        prev_processed_sec = this_processed
-                        # Reset gate-tracked byte offsets for the next utterance.
-                        utt_start = 0
-                        utt_end = 0
+                            if final and not utterance_audio:
+                                log.info("incoming refinement skipped: no proven complete audio bounds")
                         if final:
                             # Translate off the event loop so the next
                             # utterance's deltas are consumed immediately.
@@ -832,6 +824,7 @@ class Controller:
                                     card_id, final, gen,
                                     t_capture_start, t_asr_final,
                                     utterance_audio,
+                                    first_delta_at, first_card_at,
                                 )
                             )
                         # Start a fresh card for the next utterance.
@@ -841,6 +834,7 @@ class Controller:
                         t_capture_start = time.monotonic()
                         delta_count = 0
                         first_delta_at = None
+                        first_card_at = None
                         audio.prune_debug_dir(self.cfg)
                     else:
                         other_events[t or "<no-type>"] = other_events.get(t or "<no-type>", 0) + 1
@@ -851,6 +845,7 @@ class Controller:
                 )
                 if watchdog_task is not None:
                     watchdog_task.cancel()
+                    await asyncio.gather(watchdog_task, return_exceptions=True)
                 pump_task.cancel()
                 try:
                     await pump_task
@@ -864,38 +859,20 @@ class Controller:
 
     def _snapshot_utterance_audio(
         self,
-        this_processed_sec: float,
-        prev_processed_sec: float,
-        utt_start: int = 0,
-        utt_end: int = 0,
+        utt_start: int | None,
+        utt_end: int | None,
         ring_base: int = 0,
     ) -> bytes:
-        """Return the PCM16 for the utterance that just finalized, or b"".
-
-        Prefers the gate-tracked byte bounds (`utt_start`/`utt_end`, absolute
-        positions) when the silence gate is active: those delimit exactly the
-        speech window (plus its trailing silence), ignoring any gated zero-PCM
-        before/after. Falls back to the server's `audio_processed` delta (a
-        stream-global high-water mark) when there is no gate. Best-effort: on
-        any mismatch the streaming translation remains authoritative.
-        """
+        """Snapshot proven absolute sent-PCM byte bounds, never partial coverage."""
         ring = getattr(self, "_incoming_ring", None)
         if not ring:
             return b""
-        if utt_end > utt_start > 0:
-            lo = max(0, utt_start - ring_base)
-            hi = min(len(ring), utt_end - ring_base)
-            raw = bytes(ring[lo:hi])
-        else:
-            utt_len = max(this_processed_sec - prev_processed_sec, 0.0)
-            if utt_len < 0.3:
-                return b""
-            margin_sec = 0.5
-            nbytes = int((utt_len + margin_sec) * audio.RATE * 2)
-            nbytes = min(nbytes, len(ring))
-            if nbytes <= 0:
-                return b""
-            raw = bytes(ring[len(ring) - nbytes:])
+        if (type(utt_start) is not int or type(utt_end) is not int
+                or utt_start < ring_base or utt_start < 0
+                or utt_end <= utt_start or utt_end > ring_base + len(ring)
+                or utt_start % 2 or utt_end % 2):
+            return b""
+        raw = bytes(ring[utt_start - ring_base:utt_end - ring_base])
         # Skip degenerate snapshots: an empty or sub-300ms utterance is not
         # worth an offline round-trip (and an empty WAV 500s the server).
         if len(raw) < int(0.3 * audio.RATE * 2):
@@ -910,6 +887,8 @@ class Controller:
         t_capture_start: float,
         t_asr_final: float,
         utterance_audio: bytes,
+        first_delta_at: float | None = None,
+        first_card_at: float | None = None,
     ) -> None:
         """Translate a final utterance and update its card, dropping if stale."""
         src = self.cfg.incoming.source_language[:2]
@@ -924,6 +903,12 @@ class Controller:
             log.info("dropping stale incoming final (gen %d != %d)", gen, self._incoming_gen)
             return
         asr_ms = round((t_asr_final - t_capture_start) * 1000, 1)
+        self.overlay_send(
+            {"cmd": "card", "id": card_id, "direction": "in",
+             "source": final, "target": translated, "state": "incoming"}
+        )
+        if first_card_at is None:
+            first_card_at = time.monotonic()
         logging.log_event({
             "kind": "incoming",
             "direction": f"{src}→{tgt}",
@@ -931,16 +916,15 @@ class Controller:
             "src_len": len(final),
             "tgt_len": len(translated),
             "asr_ms": asr_ms,
+            "capture_start_s": t_capture_start,
+            "first_delta_receipt_s": first_delta_at,
+            "first_card_sent_s": first_card_at,
             "nmt_ms": round(nmt_ms, 1),
             "multimedia": self.cfg.incoming.multimedia,
             **({"source": final, "target": translated} if self.cfg.debug_capture else {}),
         })
         log.info("incoming translated (%s→%s): %d chars → %d chars",
                  src, tgt, len(final), len(translated))
-        self.overlay_send(
-            {"cmd": "card", "id": card_id, "direction": "in",
-             "source": final, "target": translated, "state": "incoming"}
-        )
         # Two-tier refinement: re-transcribe the utterance with the offline
         # model and replace the card in place if it yields better text.
         if self.cfg.asr.offline_enabled and utterance_audio:
@@ -976,7 +960,9 @@ class Controller:
             refined_translated = await self.nmt.translate(cleaned, src, tgt)
         except Exception as exc:
             log.error("offline refinement translation failed: %s", exc)
-            refined_translated = translated
+            return
+        if gen != self._incoming_gen or not refined_translated:
+            return
         logging.log_event({
             "kind": "incoming_refine",
             "direction": f"{src}→{tgt}",

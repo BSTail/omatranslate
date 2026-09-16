@@ -145,11 +145,42 @@ Offline bilingual (en↔es) live speech-translation plugin for Omarchy Linux
     a fresh `incoming started` with the current gen.
 
 ## Current investigation / next up (user's priority, 2026-09-15)
+- **Live verification 2026-09-16:** changes are deployed, service active;
+  publication of the tested changes and checklist requested by the user.
+  User confirms correct panel size, no visual clipping, and
+  scrolling. Screenshot's successful newest card begins "Te amo"; earlier
+  attempt starts "Para que", so actual missing opening words remain unresolved.
+  First monitored run: gate-to-first-delta 11.91s, send-to-overlay receipt ~0.4ms;
+  user saw ~12s. Later successful replay: gate-to-first-delta ~2.28s.
+- **New high-priority regression evidence:** watchdog now armed across finals
+  recycled sessions at 00:10:24 and 00:10:35, ~1.1s after gate reopen. This can
+  discard onset audio (no replay) before legitimate ASR latency elapses. Need
+  safe recovery, not assumption that one second proves a wedge. Earlier first
+  run also missed beginning without a watchdog restart, so this is not a full
+  explanation of all missing content. See journal and docs/TODO.md.
+- **Reliability fixes after overlay review:** see `docs/TODO.md` for the current
+  checklist, tests, and remaining live verification. Overlay byte-framed input
+  now drains batched commands; history-off keeps the newest card visible and
+  restores older cards correctly. Startup sends the configured history mode.
+  Gate preroll duplication, watchdog reset across finals, and pump-exit recovery
+  have regression tests. Per-card monotonic timestamps separate first ASR delta,
+  controller send, and overlay receipt (not first painted frame).
+- **Important refinement limitation:** incoming refinement now skips replacement
+  when complete utterance bounds cannot be established. The local NeMo source's
+  `audio_processed` may include buffered future audio; gate transitions are not
+  ASR utterance boundaries. Previously a 20-second ring tail could replace a full
+  transcript with only its ending. Streaming transcription/translation remain
+  enabled. Restore refinement only with proven audio coverage, not a larger
+  arbitrary ring. Installed binary/source equivalence is not yet verified.
+- **Overlay sizing status:** commits 5e888b1, 0cd7d2b, and 4f5ec01 fixed monitor
+  lookup, resize propagation, and panel shrink. User confirmed no shrink, but
+  missing text persisted. The initial 10-20-second display delay remains a live
+  investigation, not a confirmed GTK sizing failure.
 - **NEXT BUG (user's priority): overlay fixed-height clipping.** The overlay
   translation window has a too-short FIXED height that clips the bottom of
   longer translated sentences. Fix: make the window height track content
   (auto-size, capped at screen height, scroll only when at the cap). Lives in
-  `src/olt/overlay.py`. Not started yet.
+  `src/olt/overlay.py`. Historical note superseded by the sizing status above.
 - **CLOSED OUT — the idle-gap "missing-popup" bug.** (See the (a)+(b)-lite
   workaround note below and README.) Root cause was upstream; filed as #48 and
   worked around locally; verified with 20s and 2-minute idle-gap tests.
