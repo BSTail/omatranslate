@@ -145,6 +145,147 @@ Offline bilingual (en↔es) live speech-translation plugin for Omarchy Linux
     a fresh `incoming started` with the current gen.
 
 ## Current investigation / next up (user's priority, 2026-09-15)
+- **Post-final reset production validation passed, 2026-09-16 11:19:** user
+  replayed audio seven times (`in-85`..`in-91`). Every gate produced draft,
+  final, translation, and one clear request/sent/ack; all acks preceded the next
+  gate. Objective gate->first-draft: 11.908s, 5.853s, then 2.125s, 2.444s,
+  1.962s, 2.126s, 1.958s. This fixes the prior attempt3-4 no-output collapse.
+  Overlay send->receipt 0.149-0.378ms. No failures, warnings, deferrals,
+  reconnects, or restarts. First attempt was genuinely slow but sent17.52s vs
+  later5.04-13.52s; all post-clear fresh runners succeeded, so no functional
+  code change is justified yet. Important telemetry caveat: event `asr_ms` and
+  completed-log `first_delta` use the prior card/session `t_capture_start`, not
+  gate onset, and include idle time. Use gate-open monotonic->first-draft
+  monotonic for current comparisons. Potential next experiment only if needed:
+  fixed-WAV fresh-WebSocket ABBA, unprimed vs current proven warmup. `sox` and
+  `soxi` are now installed from Arch `extra` (`SoX_ng v14.8.0.1`) and available
+  for the next audio analysis.
+- **Safe post-final runner reset deployed, 2026-09-16 03:41:** verified warmup
+  did not fix live behavior. Four gates at03:14 had first deltas +11.938s,
+  +5.812s, then no events for two valid sent WAVs (6.48s/4.88s). Finals began
+  `Para que...` and `orgullosa de ti...`; overlay sub-ms; processes healthy.
+  WAV onset energy begins after only0.254-0.350s, so not controller send loss.
+  Controlled repeated A/B in `/tmp/opencode/post-final-reset/`: retaining the
+  automatic-final runner always failed at clip3 (and clip4); clear-after-final
+  produced8/8 and reduced clip2 first delta ~6.14s->2.45s. Implemented
+  pump-owned safe clear in controller: completed requests only while gate
+  closed; clear occurs only at wire silence after trailing audio; gate epochs
+  invalidate stale requests on rapid reopen; later closed completion can request
+  its own reset; 2s timeout reconnects; no commit/socket rotation. Tests:
+  controller33, full46, diff-check clean. Repo/deployed controller match. One
+  restart03:41:18; warmup proof audio_processed3.2 at03:41:23, incoming ready
+  03:41:24, active NRestarts0. Validation completed at11:14 with seven
+  consecutive successful gate/final/clear cycles; see the newer entry above.
+- **Verified streaming warmup deployed, 2026-09-16 02:59:** user prioritizes no
+  chopped beginning and earliest visible translation; exact wording is
+  secondary. Natural replays on one healthy stream measured 11.929s then 2.323s
+  gate-to-first-delta with exact400ms preroll; an earlier run repeated 11.926s
+  then ~2.1s. Exact sent WAVs contain real onset audio. Controlled same-PCM
+  tests did not reproduce12s: fresh sockets after10/30/60s idle all ~2.774s;
+  production startup shape 3.75-3.79s including55s wire idle; burst 0.884s;
+  exact slow in-7 regular replay 2.782s. Thus fresh socket, idle, startup
+  silence, and PCM alone are insufficient explanations; root cause unresolved.
+  Artifacts: `/tmp/opencode/idle-latency-matrix/`, `startup-gate-matrix/`,
+  `startup-gate-long-idle/`, `fresh-stream-burst/`, `replay-exact-slow-in7/`.
+  Old warmup sent one unpaced tone blob then immediately clear/closed without
+  consuming events. New `src/olt/nemo.py` waits session.updated, sends paced
+  1.6s tone +1.6s silence in160ms chunks, commits, requires processed
+  delta/completed proof, clears with acknowledgement, and has bounded cleanup.
+  New `tests/test_nemo.py`; full suite 38 pass. Deployed with one restart at
+  02:59:06: server ready02:59:07, proof completed/audio_processed3.2 at
+  02:59:11, offline/incoming ready02:59:12, active NRestarts0. This is startup
+  correctness, not yet a proven latency fix. Subsequent live testing and the
+  retained-runner A/B are documented in the newer entries above.
+- **Exact sent-PCM diagnostic added, 2026-09-16:** when existing
+  `debug_capture` is enabled, every multimedia gate opening writes exactly the
+  PCM bytes successfully sent to streaming NeMo into a mono PCM16/16 kHz WAV in
+  `~/.local/state/omatranslate/debug/sent/`. Names encode generation, card ID,
+  and gate monotonic timestamp. Captures start with the exact preroll+opening
+  chunk, append only open-gate sends, and finalize on gate close, stream end,
+  replacement, or shutdown. Logs include reason, path, gen/card/onset, bytes,
+  and duration. Sent artifacts have their own `debug_keep` retention; clear-logs
+  removes them recursively. No recognition, gate, threshold, stream recovery,
+  framing, or wire-silence behavior changed. Focused tests verify exact payload,
+  WAV format, gate-close lifecycle, and cancellation lifecycle. All 34 tests
+  pass; real-GTK passes 8 with 1 synthetic-only skip. Repo/deployed sources
+  match. One requested restart at 02:03:03 produced controller PID 1760045,
+  streaming/offline NeMo PIDs 1760065/1760087, and overlay PID 1760114; all were
+  ready by 02:03:05, systemd `NRestarts=0`, and the 8080 stream is established.
+  No replay was run, so `debug/sent/` is created on the next natural gate open.
+- **Latest live diagnosis before diagnostic deployment:** service PID 1742698
+  and NeMo PIDs 1742717/1742739 stayed alive with systemd `NRestarts=0` after
+  01:33. Productive gate-to-first-delta times were 2.280s, 1.989s, and 2.154s.
+  Five gate openings from 01:43:48 through 01:45:24 emitted no delta/final before
+  the session ended cleanly and reconnected at 01:50:34 against the same backend
+  PID. This supports a nonproductive ASR session, not a hung/restarted process.
+  Screenshot top card was finalized history `in-13` (`Amo papi me siento muy...`
+  / `Master Daddy I feel very...`), not an active partial; later no-result gates
+  created no card. Exact audio content at the missing onset remained the key
+  evidence gap, which the sent-PCM diagnostic is designed to close.
+- **Whole-chunk mitigation WITHDRAWN, 2026-09-16 01:33:** user reports worse.
+  Only rounding reverted in repo/tests/deployed controller using apply_patch:
+  exact400ms bounded bytearray preroll retains quiet/soft history; warning-only
+  watchdog, wire-silent idle and refinement safeguards preserved. 32 tests pass;
+  deployed source verified before patching, one restart at 01:33:09, both models
+  warmed/incoming active by 01:33:12. No commits; live rollback retest pending.
+  After 01:25, all openings really delivered 480ms (15360B) preroll. Drafts at
+  01:27:36/01:27:52/01:28:30 lagged latest opening by 12.045/1.313/11.618s;
+  finals start "Para que" / "haciendo por cada cosa" / "Para que". Overlay
+  send-to-receipt 0.29-0.38ms. Openings 01:28:01/01:28:12 had no draft before
+  01:28:30 (28.736s from first); 01:29:21 opening had no delta/final before
+  stream ended 01:30:06. Same stream across all these events; not watchdog loss.
+  Requested bounded endpointing-on/off replay BLOCKED by source inspection:
+  HTTP session parser only supports endpointing_ms threshold, not enable/off;
+  <=0 restores default. session.updated merely echoes fields. No replay/new
+  server/global changes or oversized-threshold substitute. Evidence artifact:
+  /tmp/opencode/endpointing-comparison-blocker.md. NEXT: verify installed binary
+  provenance and a supported per-session disable path before same-PCM regular
+  framing + commit/drain comparison; otherwise obtain approval for a separately
+  controlled endpointing test. Do not add alignment padding or hard gate commits.
+- **Latest mitigation deployed, 2026-09-16 01:25:** retain whole capture chunks
+  for preroll (400ms target becomes 480ms at 160ms chunks), not partial chunks.
+  No synthetic padding; wire-silent idle and safety guards preserved. 33 tests
+  passed; service active and warmed after restart. Live replay still needed.
+  Regularly framed gated PCM reproduced missing passage twice, ruling out wire
+  gaps/burst framing as necessary causes. An 80ms shift restored earlier passage;
+  whole-chunk 480ms gated replay restored it in two captured intervals, likely
+  repeated playback of the same speech. Still starts "Ama", not "Te amo".
+  Evidence supports mitigation, not universal correctness or proven upstream bug.
+  Source/model suggest 80ms encoder stride and 160ms processing blocks; installed
+  binary provenance remains unverified. All experiments used existing server,
+  sequential sessions with ping/pong and commit/drain; no test server created.
+  Artifacts: /tmp/opencode/gate-regular-003824/, gate-phase80-003824/,
+  gate-regular-repeat-003824/, gate-second-400/, gate-second-480/,
+  gate-first-480/. Changes remain uncommitted. NEXT: live replay same clip twice
+  and genuinely different Spanish speech after idle; inspect onset and latency.
+- **Controlled ABBA experiment completed (2026-09-16):** fresh gated/ungated/
+  ungated/gated sessions using identical capture interval [50.24, 80.00) seconds
+  from `~/.local/state/omatranslate/debug/in-20260916-003824.wav`. Both gated
+  finals start "Para que"; both ungated finals retain earlier passage starting
+  "Ama papi" (still not the intended "Te amo papi"). First-delta delays from
+  detected activity: 12.241/2.777/2.781/12.231s. The 527360-byte detected activity
+  interval [56.32,72.80) is contiguous and unchanged in gated sent PCM. This
+  implicates combined gate history/framing/timing, not simple removal of that
+  interval; threshold-derived activity is not proof of exact acoustic boundaries.
+  Artifacts: `/tmp/opencode/gate-abba-003824/` (summary.json, input.wav, exact
+  sent WAVs and event/send logs); script `/tmp/opencode/gate_experiment.py`.
+  No production changes/restarts; live PIDs unchanged. Independent review found
+  comparison credible but shared compute and unknown installed binary provenance
+  remain limitations. Natural finals preceded EOF; 20s wait without commit does
+  not prove full drain, and diagnostic reader does not answer ping frames.
+  NEXT: replay exact gated sent WAV in regular 160ms frames paced by its own
+  sample timeline. If onset returns, transport schedule/framing is implicated;
+  otherwise concatenated PCM history remains sufficient. Prefer an independently
+  owned server (historical concurrency crash risk); add ping/pong and final commit
+  acknowledgement. Do not disable production gating based on this single clip.
+  Last pushed commit remains 91b7bff; preroll/controller tests and notes remain
+  uncommitted. Temporary artifacts are local, not committed or uploaded.
+- **Latest replays (00:39-00:40, after continuous-preroll fix):** full 400 ms
+  preroll delivered; gate-to-delta times 11.92s, 2.32s, 2.28s. Transcripts still
+  misrecognize/drop the opening: "Ama papi" instead of "Te amo papi". The gate
+  fix is active but does not resolve the missing beginning. Further threshold
+  tuning is likely guessing; next step is a controlled same-audio comparison
+  (gating bypassed vs enabled) recording exact sent PCM and every delta/final.
 - **Watchdog safety correction (2026-09-16, deployed at 00:30):** removed automatic
   stream closure on missing deltas. A diagnostic monitor now warns after 15s,
   once per gate onset, without interrupting capture/ASR. Delayed post-final and

@@ -29,6 +29,7 @@ log = logging.get()
 # A timeout cannot prove a wedge. Recovery needs continuous capture and complete
 # replay before it can safely replace a stream that has accepted speech.
 _ASR_DELAY_WARNING_S = 15.0
+_STREAM_CLEAR_TIMEOUT_S = 2.0
 
 
 class SilenceGate:
@@ -104,7 +105,7 @@ class SilenceGate:
             else:
                 self._quiet_ms = 0.0
                 return chunk
-        # Closed (or just closed): gate real speech as preroll.
+        # Closed (or just closed): require consecutive loud chunks to reopen.
         if rms > self.open_rms:
             self._loud_ms += chunk_ms
             if self._loud_ms >= self.open_ms:
@@ -118,12 +119,11 @@ class SilenceGate:
                     rms, self.open_rms, self.open_ms, len(preroll),
                 )
                 return preroll + chunk
-            self._preroll.extend(chunk)
-            if len(self._preroll) > self._preroll_cap:
-                del self._preroll[: len(self._preroll) - self._preroll_cap]
         else:
             self._loud_ms = 0.0
-            self._preroll.clear()
+        self._preroll.extend(chunk)
+        if len(self._preroll) > self._preroll_cap:
+            del self._preroll[: len(self._preroll) - self._preroll_cap]
         # Still closed: bounded trailing silence, then wire silence.
         if self._trailing_left_ms > 0:
             self._trailing_left_ms = max(0.0, self._trailing_left_ms - chunk_ms)
@@ -677,6 +677,46 @@ class Controller:
         onset_mono: float | None = None
         onset_delta_count = 0
         onset_warned = False
+        gate_epoch = 0
+        reset_request_epoch: int | None = None
+        reset_sent = 0
+        reset_acked = 0
+        sent_capture: audio.DebugPcmWriter | None = None
+        sent_capture_card: str | None = None
+        sent_capture_onset: float | None = None
+
+        def finish_sent_capture(reason: str) -> None:
+            nonlocal sent_capture, sent_capture_card, sent_capture_onset
+            if sent_capture is None:
+                return
+            path, byte_count = sent_capture.close()
+            duration = byte_count / (audio.RATE * 2)
+            log.info(
+                "gate sent capture finalized (%s): %s, gen %d, card %s, "
+                "gate monotonic %.6f, %d bytes, %.3fs",
+                reason, path, gen, sent_capture_card,
+                sent_capture_onset or -1.0, byte_count, duration,
+            )
+            sent_capture = None
+            sent_capture_card = None
+            sent_capture_onset = None
+            audio.prune_debug_dir(self.cfg)
+
+        def start_sent_capture() -> None:
+            nonlocal sent_capture, sent_capture_card, sent_capture_onset
+            if not self.cfg.debug_capture or onset_mono is None:
+                return
+            finish_sent_capture("replaced")
+            sent_capture_card = card_id
+            sent_capture_onset = onset_mono
+            tag = f"sent-g{gen}-{card_id}-m{int(onset_mono * 1_000_000)}"
+            try:
+                sent_capture = audio.DebugPcmWriter(
+                    Path(self.cfg.debug_dir) / "sent", tag,
+                )
+            except Exception as exc:
+                log.warning("could not start sent-audio capture: %s", exc)
+                sent_capture = None
         # Silence gate is only meaningful in multimedia mode (continuous media
         # audio). In live-call mode audio flows unfiltered.
         gate = None
@@ -695,6 +735,7 @@ class Controller:
             async def pump():
                 nonlocal captured_bytes, ring_base
                 nonlocal onset_mono, onset_delta_count, onset_warned
+                nonlocal gate_epoch, reset_request_epoch, reset_sent
                 try:
                     while True:
                         chunk = await cap.read_chunk(self.cfg.chunk_ms)
@@ -704,15 +745,26 @@ class Controller:
                             was_open = gate.open
                             chunk = gate.process(chunk, self.cfg.chunk_ms)
                             if not was_open and gate.open:
+                                gate_epoch += 1
+                                if (reset_request_epoch is not None
+                                        and reset_request_epoch != gate_epoch):
+                                    log.info(
+                                        "post-final stream clear deferred by gate reopen "
+                                        "(gen %d, requested epoch %d, current epoch %d)",
+                                        gen, reset_request_epoch, gate_epoch,
+                                    )
+                                    reset_request_epoch = None
                                 onset_mono = time.monotonic()
                                 onset_delta_count = stream_delta_count
                                 onset_warned = False
+                                start_sent_capture()
                                 log.info(
                                     "gate opened (stream %.2fs, preroll+chunk %d bytes, monotonic %.6f)",
                                     captured_bytes / (audio.RATE * 2), len(chunk), onset_mono,
                                 )
                             elif was_open and not gate.open:
                                 onset_mono = None
+                                finish_sent_capture("gate-close")
                                 log.info(
                                     "gate closed (stream %.2fs)",
                                     captured_bytes / (audio.RATE * 2),
@@ -720,8 +772,29 @@ class Controller:
                             if chunk is None:
                                 # Idle: wire silence. This is what avoids the
                                 # upstream zero-PCM wedge during long quiet runs.
+                                if reset_request_epoch == gate_epoch:
+                                    reset_request_epoch = None
+                                    reset_sent += 1
+                                    try:
+                                        await asyncio.wait_for(
+                                            stream.clear(), timeout=_STREAM_CLEAR_TIMEOUT_S
+                                        )
+                                    except Exception as exc:
+                                        log.error(
+                                            "post-final stream clear failed "
+                                            "(gen %d, reset %d): %s",
+                                            gen, reset_sent, exc,
+                                        )
+                                        raise
+                                    log.info(
+                                        "post-final stream clear sent "
+                                        "(gen %d, reset %d)",
+                                        gen, reset_sent,
+                                    )
                                 continue
                         await stream.send_audio(chunk)
+                        if sent_capture is not None and gate is not None and gate.open:
+                            sent_capture.write(chunk)
                         if self.cfg.asr.offline_enabled:
                             self._incoming_ring.extend(chunk)
                             if len(self._incoming_ring) > ring_cap:
@@ -794,6 +867,24 @@ class Controller:
                             gen, len(final), ev.get("audio_processed"),
                             delta_count, first_delta_at - t_capture_start if first_delta_at is not None else -1.0,
                         )
+                        if gate is not None:
+                            if gate.open:
+                                # This may be a late final from an older gate.
+                                # Clearing could erase speech already accepted
+                                # from the currently open gate, so leave this
+                                # runner intact until a closed-gate final.
+                                log.info(
+                                    "post-final stream clear skipped while gate open "
+                                    "(gen %d, epoch %d)",
+                                    gen, gate_epoch,
+                                )
+                            else:
+                                reset_request_epoch = gate_epoch
+                                log.info(
+                                    "post-final stream clear requested "
+                                    "(gen %d, epoch %d)",
+                                    gen, reset_request_epoch,
+                                )
                         utterance_audio = b""
                         if self.cfg.asr.offline_enabled:
                             # NeMo CacheStreamRunner::step reports supplied
@@ -826,6 +917,13 @@ class Controller:
                         first_delta_at = None
                         first_card_at = None
                         audio.prune_debug_dir(self.cfg)
+                    elif t == "input_audio_buffer.cleared":
+                        reset_acked += 1
+                        log.info(
+                            "post-final stream clear acknowledged "
+                            "(gen %d, ack %d, sent %d)",
+                            gen, reset_acked, reset_sent,
+                        )
                     else:
                         other_events[t or "<no-type>"] = other_events.get(t or "<no-type>", 0) + 1
             finally:
@@ -841,6 +939,7 @@ class Controller:
                     await pump_task
                 except (asyncio.CancelledError, Exception):
                     pass
+                finish_sent_capture("stream-end")
         finally:
             await cap.stop()
             await stream.close()
@@ -1240,7 +1339,7 @@ class Controller:
             patterns = ("olt.log", "olt.log.*", "events.jsonl")
             paths = [p for pat in patterns for p in log_dir.glob(pat)]
             if self.cfg.debug_capture:
-                paths += [p for p in Path(self.cfg.debug_dir).glob("*.wav")]
+                paths += [p for p in Path(self.cfg.debug_dir).rglob("*.wav")]
             for path in paths:
                 try:
                     path.unlink()

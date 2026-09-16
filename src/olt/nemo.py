@@ -23,6 +23,15 @@ from .config import ASRConfig, PathsConfig
 
 log = logging.get()
 
+_STREAM_WARMUP_CHUNK_MS = 160
+_STREAM_WARMUP_TONE_S = 1.6
+_STREAM_WARMUP_TRAILING_S = 1.6
+_STREAM_WARMUP_IO_TIMEOUT_S = 5.0
+_STREAM_WARMUP_AUDIO_TIMEOUT_S = 10.0
+_STREAM_WARMUP_SESSION_TIMEOUT_S = 5.0
+_STREAM_WARMUP_PROOF_TIMEOUT_S = 15.0
+_STREAM_WARMUP_CLEAR_TIMEOUT_S = 2.0
+
 
 class NemoASR:
     def __init__(self, paths: PathsConfig, asr_cfg: ASRConfig):
@@ -283,29 +292,109 @@ class NemoASR:
         """Compile the streaming model's Vulkan pipelines before first use.
 
         `serve` runs with `--no-warmup` (the built-in warmup path is the one
-        that intermittently SIGABRTs), so the encoder's compute pipelines are
-        compiled lazily on the first real audio. Feeding a short burst of real
-        audio through a throwaway stream forces that compilation now, and the
-        buffer is cleared so no phantom transcript survives.
+        that intermittently SIGABRTs), so exercise a throwaway stream and wait
+        for an ASR event that proves the server processed it. The stream is
+        discarded, so warmup text can never reach the production transcript.
         """
+        stream = None
+        event_task: asyncio.Task | None = None
         try:
-            stream = await self.connect_stream(language, endpointing_ms=1000)
-            # ~1.6s of a 440 Hz sine at a modest level: real PCM, not silence.
+            stream = await asyncio.wait_for(
+                self.connect_stream(language, endpointing_ms=1000),
+                timeout=_STREAM_WARMUP_IO_TIMEOUT_S,
+            )
+            session_ready = asyncio.Event()
+            inference_seen = asyncio.Event()
+            cleared = asyncio.Event()
+            proof: dict[str, object] = {}
+
+            async def consume_events() -> None:
+                async for event in stream.events():
+                    event_type = event.get("type")
+                    if event_type == "session.updated":
+                        session_ready.set()
+                    elif event_type == "input_audio_buffer.cleared":
+                        cleared.set()
+                    elif event_type == "conversation.item.input_audio_transcription.completed":
+                        proof.update(type=event_type, audio_processed=event.get("audio_processed"))
+                        inference_seen.set()
+                    elif event_type == "conversation.item.input_audio_transcription.delta":
+                        processed = event.get("audio_processed")
+                        if isinstance(processed, (int, float)) and processed > 0:
+                            proof.update(type=event_type, audio_processed=processed)
+                            inference_seen.set()
+
+            event_task = asyncio.create_task(
+                consume_events(), name="olt-stream-warmup-events"
+            )
+            await asyncio.wait_for(
+                session_ready.wait(), timeout=_STREAM_WARMUP_SESSION_TIMEOUT_S
+            )
+
+            # Pace production-sized frames so the throwaway session exercises
+            # the same incremental path as incoming audio. Trailing silence can
+            # trigger endpointing; commit guarantees a final drain if it does not.
             rate = 16000
-            dur = 1.6
-            n = int(rate * dur)
+            chunk_samples = int(rate * _STREAM_WARMUP_CHUNK_MS / 1000)
+            tone_samples = int(rate * _STREAM_WARMUP_TONE_S)
+            silence_samples = int(rate * _STREAM_WARMUP_TRAILING_S)
             import math as _math
 
-            tone = bytearray()
-            for i in range(n):
-                s = int(12000.0 * _math.sin(2.0 * _math.pi * 440.0 * i / rate))
-                tone += struct.pack("<h", s)
-            await stream.send_audio(bytes(tone))
-            await stream.clear()
-            await stream.close()
-            log.info("streaming ASR warmed (pipeline compiled)")
+            async def send_warmup_audio() -> None:
+                deadline = asyncio.get_running_loop().time()
+                for start in range(0, tone_samples, chunk_samples):
+                    end = min(start + chunk_samples, tone_samples)
+                    chunk = bytearray()
+                    for i in range(start, end):
+                        sample = int(
+                            12000.0 * _math.sin(2.0 * _math.pi * 440.0 * i / rate)
+                        )
+                        chunk += struct.pack("<h", sample)
+                    await stream.send_audio(bytes(chunk))
+                    deadline += (end - start) / rate
+                    await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
+                silence = bytes(chunk_samples * 2)
+                for start in range(0, silence_samples, chunk_samples):
+                    count = min(chunk_samples, silence_samples - start)
+                    await stream.send_audio(silence[:count * 2])
+                    deadline += count / rate
+                    await asyncio.sleep(max(0.0, deadline - asyncio.get_running_loop().time()))
+
+            await asyncio.wait_for(
+                send_warmup_audio(), timeout=_STREAM_WARMUP_AUDIO_TIMEOUT_S
+            )
+            await asyncio.wait_for(
+                stream.commit(), timeout=_STREAM_WARMUP_IO_TIMEOUT_S
+            )
+            await asyncio.wait_for(
+                inference_seen.wait(), timeout=_STREAM_WARMUP_PROOF_TIMEOUT_S
+            )
+            await asyncio.wait_for(
+                stream.clear(), timeout=_STREAM_WARMUP_IO_TIMEOUT_S
+            )
+            try:
+                await asyncio.wait_for(
+                    cleared.wait(), timeout=_STREAM_WARMUP_CLEAR_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                log.warning("streaming ASR warm-up clear acknowledgement timed out")
+            log.info(
+                "streaming ASR warmed (event %s, audio_processed %r)",
+                proof.get("type"), proof.get("audio_processed"),
+            )
         except Exception as exc:
             log.warning("streaming ASR warm-up failed (non-fatal): %s", exc)
+        finally:
+            if event_task is not None:
+                event_task.cancel()
+                await asyncio.gather(event_task, return_exceptions=True)
+            if stream is not None:
+                try:
+                    await asyncio.wait_for(
+                        stream.close(), timeout=_STREAM_WARMUP_IO_TIMEOUT_S
+                    )
+                except Exception as exc:
+                    log.warning("streaming ASR warm-up close failed: %s", exc)
 
     async def warm_offline(self) -> None:
         """Compile the offline model's Vulkan pipelines before first use.

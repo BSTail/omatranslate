@@ -35,6 +35,44 @@ CHANNELS = 1
 SILENCE_RMS = 100.0
 
 
+class DebugPcmWriter:
+    """Best-effort bounded diagnostic writer for PCM already sent to ASR."""
+
+    def __init__(self, debug_dir: Path, tag: str):
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.path = debug_dir / f"{tag}-{stamp}.wav"
+        self.bytes_written = 0
+        self._wav: wave.Wave_write | None = wave.open(str(self.path), "wb")
+        self._wav.setnchannels(CHANNELS)
+        self._wav.setsampwidth(2)
+        self._wav.setframerate(RATE)
+
+    def write(self, pcm: bytes) -> None:
+        if self._wav is None or not pcm:
+            return
+        try:
+            self._wav.writeframes(pcm)
+            self.bytes_written += len(pcm)
+        except (OSError, wave.Error) as exc:
+            log.warning("sent-audio capture write failed for %s: %s", self.path, exc)
+
+    def close(self) -> tuple[Path, int]:
+        wav = self._wav
+        self._wav = None
+        if wav is not None:
+            try:
+                wav.close()
+            except OSError as exc:
+                log.warning("sent-audio capture close failed for %s: %s", self.path, exc)
+        if self.bytes_written == 0:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        return self.path, self.bytes_written
+
+
 def prune_debug_captures(debug_dir: Path, keep: int) -> None:
     """Keep only the newest `keep` capture files in the debug directory.
 
@@ -306,6 +344,7 @@ def monitor_capture(cfg: Config) -> Capture:
 def prune_debug_dir(cfg: Config) -> None:
     if cfg.debug_capture:
         prune_debug_captures(Path(cfg.debug_dir), cfg.debug_keep)
+        prune_debug_captures(Path(cfg.debug_dir) / "sent", cfg.debug_keep)
 
 
 def prune_debug_dir_startup(cfg: Config) -> None:
@@ -318,3 +357,4 @@ def prune_debug_dir_startup(cfg: Config) -> None:
     if cfg.debug_capture:
         prune_debug_silent(Path(cfg.debug_dir))
         prune_debug_captures(Path(cfg.debug_dir), cfg.debug_keep)
+        prune_debug_captures(Path(cfg.debug_dir) / "sent", cfg.debug_keep)
