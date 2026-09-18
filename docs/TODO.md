@@ -2,6 +2,17 @@
 
 ## Handoff Status
 
+Latest (2026-09-16 13:27): fixed-WAV fresh-WebSocket immediate/55s-wire-idle
+ABBA completed in order immediate-idle-idle-immediate. All four runs sent the
+same `in-85` PCM and produced the same first nonempty delta (`Me`) at
+`audio_processed=4.48`, the same final transcript, and `audio_processed=18.96`.
+Immediate first-delta mean was 4.417s versus idle 4.384s; final means were
+18.965s versus 18.943s. There was exactly one final per run, no errors/aborts,
+and controller PID 1817452, NeMo PID 1817460, and NRestarts=0 remained stable.
+Therefore a 55s fresh-socket wire-idle period has no adverse latency or opening
+effect and does not explain the natural first-play delay. Evidence:
+`/tmp/opencode/fresh-ws-idle-abba-20260916-132309/`.
+
 Latest (2026-09-16 12:35): fixed-WAV fresh-WebSocket ABBA completed in order
 A-B-B-A, where A sent immediately after `session.updated` and B first proved
 inference with the deployed 1.6s tone + 1.6s silence warmup, then cleared and

@@ -53,6 +53,26 @@ Panel {
   property color themeGreen: "#29D398"
   property color themeCyan: "#59E1E3"
 
+  // Plugin-local glow geometry for the header start/stop button (not a theme
+  // token). The halo extends this far past the button on every side, so the
+  // header row and right margin below reserve room for it. Core QtQuick only
+  // (no FastBlur / external module) so Quickshell can load it.
+  readonly property real glowSpread: 10
+
+  // Looping 0..1..0 phase that drives the halo pulse. A single ping-pong
+  // NumberAnimation on a plain property is guaranteed to oscillate every
+  // cycle (unlike re-evaluating `from:` inside a looping SequentialAnimation).
+  property real glowPhase: 0
+
+  NumberAnimation on glowPhase {
+    from: 0.0
+    to: 1.0
+    duration: 1400
+    easing.type: Easing.InOutSine
+    loops: Animation.Infinite
+    running: root.opened
+  }
+
   FileView {
     id: themeColors
     path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
@@ -125,6 +145,15 @@ Panel {
     svcProc.action = action
     svcProc.running = false
     svcProc.running = true
+  }
+
+  function bumpGate(delta) {
+    var v = Math.round(root.gateOpenRms) + delta
+    if (v < 50) v = 50
+    if (v > 2000) v = 2000
+    root.gateOpenRms = v
+    gateField.text = String(v)
+    root.applySettings({ "gate": { "open_rms": v } })
   }
 
   function copyDiagnostics() {
@@ -231,31 +260,38 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Flickable {
-        id: settingsScroll
-        anchors.fill: parent
-        contentWidth: width
-        contentHeight: settingsColumn.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        interactive: contentHeight > height
+        Flickable {
+          id: settingsScroll
+          anchors.fill: parent
+          contentWidth: width
+          contentHeight: settingsColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          interactive: contentHeight > height
 
-        Column {
+          Rectangle {
+            anchors.fill: parent
+            color: Color.popups.background
+          }
+
+          Column {
           id: settingsColumn
           width: settingsScroll.width
-          spacing: Style.space(10)
+          spacing: Style.space(20)
 
           // ---- header ----------------------------------------------------
           Item {
             width: parent.width
-            height: Style.space(40)
+            // Tall enough that the glow halo (glowSpread past the button on every
+            // side) stays inside the Flickable and never clips at the panel edge.
+            height: Style.space(56)
 
             Text {
               id: headerGlyph
               text: "\uf1ab"
               color: root.serviceRunning ? Style.hoverStateColor(root.bar.foreground, Color.accent) : Qt.darker(root.bar.foreground, 1.5)
               font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.heading
+              font.pixelSize: Math.round(Style.font.heading * 2)
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
             }
@@ -271,7 +307,7 @@ Panel {
                 text: "OmaTranslate"
                 color: root.themeAccent
                 font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.title
+                font.pixelSize: Style.font.heading
                 font.bold: true
               }
 
@@ -284,297 +320,394 @@ Panel {
               }
             }
 
-            Button {
-              id: headerButton
+            // Accent glow halo behind the start/stop button: a smooth Gaussian-like
+            // falloff from concentric rings (core QtQuick only — no Mask/FastBlur /
+            // external module, which Quickshell can't load). The sharp Button
+            // renders once on top.
+            Item {
+              id: headerButtonWrap
+              width: headerButton.implicitWidth + root.glowSpread * 2
+              height: headerButton.implicitHeight + root.glowSpread * 2
               anchors.right: parent.right
-              anchors.rightMargin: Style.space(10)
+              // Keeps the button's right edge where it was before the halo.
+              anchors.rightMargin: Math.max(0, Style.space(10) - root.glowSpread)
               anchors.verticalCenter: parent.verticalCenter
-              text: root.serviceRunning ? "Stop" : "Start"
-              iconText: "\uf011"
-              bordered: true
-              foreground: root.bar.foreground
-              accent: Color.accent
-              fontFamily: root.bar.fontFamily
-              onClicked: root.toggleService()
-            }
-          }
 
-          PanelSeparator {}
+              // Halo from many concentric rounded rings whose opacity falls off
+              // smoothly (Gaussian-like) — reads as one soft glow, not bands.
+              // Core QtQuick only (no Mask/FastBlur/external module). The pulse is
+              // driven by root.glowPhase so every ring breathes each cycle.
+              Repeater {
+                model: 24
 
-          // ---- outgoing --------------------------------------------------
-          PanelSectionHeader { text: "OUTGOING"; foreground: root.themeAccent }
-
-          ButtonGroup {
-            id: directionGroup
-            width: parent.width
-            foreground: root.bar.foreground
-            background: Color.popups.background
-            accent: root.themeAccent
-            fontFamily: root.bar.fontFamily
-            value: root.direction
-            options: [
-              { value: "en-es", label: "EN → ES", tooltip: "You speak English, it speaks Spanish" },
-              { value: "es-en", label: "ES → EN", tooltip: "You speak Spanish, it speaks English" }
-            ]
-            onChanged: function(v) { root.direction = v; root.applySettings({ "direction": v }) }
-          }
-
-          Toggle {
-            width: parent.width
-            label: "Auto-speak"
-            description: "Speak the translation automatically after you release F10"
-            checked: root.autoSpeak
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.autoSpeak = !root.autoSpeak
-              root.applySettings({ "auto_speak": root.autoSpeak })
-            }
-          }
-
-          Toggle {
-            width: parent.width
-            label: "Speak through speakers"
-            description: "ON: play translation on your speakers (testing). OFF: route to the virtual microphone (calls)."
-            checked: root.outputDestination === "speakers"
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.outputDestination = (root.outputDestination === "speakers") ? "virtual_mic" : "speakers"
-              root.applySettings({ "output_destination": root.outputDestination })
-            }
-          }
-
-          PanelSeparator {}
-
-          // ---- incoming --------------------------------------------------
-          PanelSectionHeader { text: "INCOMING"; foreground: root.themeCyan }
-
-          Toggle {
-            width: parent.width
-            label: "Listen for incoming speech"
-            description: "Transcribe the other side of the call (holds the mic open)"
-            checked: root.incomingEnabled
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.incomingEnabled = !root.incomingEnabled
-              root.applySettings({ "incoming_enabled": root.incomingEnabled })
-            }
-          }
-
-          ButtonGroup {
-            id: incomingDirectionGroup
-            width: parent.width
-            foreground: root.bar.foreground
-            background: Color.popups.background
-            accent: root.themeCyan
-            fontFamily: root.bar.fontFamily
-            value: root.incomingDirection
-            options: [
-              { value: "es-en", label: "ES → EN", tooltip: "The other person speaks Spanish" },
-              { value: "en-es", label: "EN → ES", tooltip: "The other person speaks English" }
-            ]
-            onChanged: function(v) {
-              root.incomingDirection = v
-              root.applySettings({ "incoming_direction": v })
-            }
-          }
-
-          Toggle {
-            width: parent.width
-            label: "Multimedia mode"
-            description: "For videos/voice messages: longer end-of-utterance window so continuous speech is segmented into cards"
-            checked: root.multimedia
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.multimedia = !root.multimedia
-              root.applySettings({ "multimedia": root.multimedia })
-            }
-          }
-
-          Toggle {
-            width: parent.width
-            visible: root.multimedia
-            label: "Ignore silence"
-            description: "Mute the monitor while it stays quiet so idle speaker noise can't produce phantom translations"
-            checked: root.gateEnabled
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.gateEnabled = !root.gateEnabled
-              root.applySettings({ "gate": { "enabled": root.gateEnabled } })
-            }
-          }
-
-          Column {
-            width: parent.width
-            spacing: Style.space(6)
-            visible: root.multimedia
-
-            Text {
-              width: parent.width
-              text: "Minimum speech level"
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-            }
-
-            Row {
-              width: parent.width
-              spacing: Style.space(10)
-
-              PanelSlider {
-                id: gateSlider
-                bar: root.bar
-                width: parent.width - gateValue.implicitWidth - Style.space(10)
-                anchors.verticalCenter: parent.verticalCenter
-                minimum: 50
-                maximum: 2000
-                step: 10
-                value: root.gateOpenRms
-                integer: true
-                onReleased: function(v) {
-                  root.gateOpenRms = v
-                  root.applySettings({ "gate": { "open_rms": v } })
+                Rectangle {
+                  required property int index
+                  anchors.centerIn: parent
+                  readonly property real t: index / (24 - 1)   // 0 = innermost, 1 = outermost
+                  width: headerButton.implicitWidth + root.glowSpread * 2 * t
+                  height: headerButton.implicitHeight + root.glowSpread * 2 * t
+                  radius: Style.cornerRadius + root.glowSpread * t
+                  color: root.themeAccent
+                  // Smooth falloff (bright at the button, ~0 at the rim) x pulse.
+                  // Pulse floor is 0 so the glow fully fades out each cycle.
+                  opacity: 0.046875 * Math.exp(-4.0 * t * t) * root.glowPhase
                 }
               }
 
-              Text {
-                id: gateValue
-                text: Math.round(root.gateOpenRms)
-                color: Qt.darker(root.bar.foreground, 1.3)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                anchors.verticalCenter: parent.verticalCenter
+              Button {
+                id: headerButton
+                anchors.centerIn: parent
+                text: root.serviceRunning ? "Stop" : "Start"
+                iconText: "\uf011"
+                bordered: true
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: root.toggleService()
               }
             }
+          }
 
-            Text {
-              width: parent.width
-              text: "Higher = only louder audio is translated. Lower = more sensitive to quiet speech."
-              color: Qt.darker(root.bar.foreground, 1.5)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
+          // ---- outgoing --------------------------------------------------
+          Rectangle {
+            width: parent.width
+            implicitHeight: outgoingCol.implicitHeight + Style.space(12) * 2
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.04)
+            border.color: Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.35)
+            border.width: 1
+
+            Column {
+              id: outgoingCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(12)
+              spacing: Style.space(8)
+
+              PanelSectionHeader { text: "OUTGOING"; foreground: root.themeAccent; fontSize: Style.font.body }
+
+              ButtonGroup {
+                id: directionGroup
+                width: parent.width
+                foreground: root.bar.foreground
+                background: Color.popups.background
+                accent: root.themeAccent
+                fontFamily: root.bar.fontFamily
+                value: root.direction
+                options: [
+                  { value: "en-es", label: "EN → ES", tooltip: "You speak English, it speaks Spanish" },
+                  { value: "es-en", label: "ES → EN", tooltip: "You speak Spanish, it speaks English" }
+                ]
+                onChanged: function(v) { root.direction = v; root.applySettings({ "direction": v }) }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Auto-speak"
+                description: "Speak the translation automatically after you release F10"
+                checked: root.autoSpeak
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.autoSpeak = !root.autoSpeak
+                  root.applySettings({ "auto_speak": root.autoSpeak })
+                }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Speak through speakers"
+                description: "ON: play translation on your speakers (testing). OFF: route to the virtual microphone (calls)."
+                checked: root.outputDestination === "speakers"
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.outputDestination = (root.outputDestination === "speakers") ? "virtual_mic" : "speakers"
+                  root.applySettings({ "output_destination": root.outputDestination })
+                }
+              }
             }
           }
 
-          Toggle {
+          // ---- incoming --------------------------------------------------
+          Rectangle {
             width: parent.width
-            label: "Two-tier accuracy"
-            description: "Re-transcribe each finished phrase with a more accurate offline model (Parakeet) and replace the text in place"
-            checked: root.twoTier
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.twoTier = !root.twoTier
-              root.applySettings({ "two_tier": root.twoTier })
-            }
-          }
+            implicitHeight: incomingCol.implicitHeight + Style.space(12) * 2
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.themeCyan.r, root.themeCyan.g, root.themeCyan.b, 0.04)
+            border.color: Qt.rgba(root.themeCyan.r, root.themeCyan.g, root.themeCyan.b, 0.35)
+            border.width: 1
 
-          Toggle {
-            width: parent.width
-            label: "Translation history"
-            description: "ON: keep all cards (scrollable). OFF: show only the newest card."
-            checked: root.history
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.history = !root.history
-              root.applySettings({ "history": root.history })
-            }
-          }
+            Column {
+              id: incomingCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(12)
+              spacing: Style.space(8)
 
-          PanelSeparator {}
+              PanelSectionHeader { text: "INCOMING"; foreground: root.themeCyan; fontSize: Style.font.body }
 
-          // ---- glossary --------------------------------------------------
-          PanelSectionHeader { text: "GLOSSARY"; foreground: root.themeGreen }
+              Toggle {
+                width: parent.width
+                label: "Listen for incoming speech"
+                description: "Transcribe the other side of the call (holds the mic open)"
+                checked: root.incomingEnabled
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.incomingEnabled = !root.incomingEnabled
+                  root.applySettings({ "incoming_enabled": root.incomingEnabled })
+                }
+              }
 
-          Toggle {
-            width: parent.width
-            label: "Word boosting"
-            description: "Bias recognition toward names and terms you add below"
-            checked: root.glossaryEnabled
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.glossaryEnabled = !root.glossaryEnabled
-              root.applySettings({ "glossary": { "enabled": root.glossaryEnabled, "phrases": root.glossaryPhrases, "boost": root.glossaryBoost } })
-            }
-          }
+              ButtonGroup {
+                id: incomingDirectionGroup
+                width: parent.width
+                foreground: root.bar.foreground
+                background: Color.popups.background
+                accent: root.themeCyan
+                fontFamily: root.bar.fontFamily
+                value: root.incomingDirection
+                options: [
+                  { value: "es-en", label: "ES → EN", tooltip: "The other person speaks Spanish" },
+                  { value: "en-es", label: "EN → ES", tooltip: "The other person speaks English" }
+                ]
+                onChanged: function(v) {
+                  root.incomingDirection = v
+                  root.applySettings({ "incoming_direction": v })
+                }
+              }
 
-          TextField {
-            id: glossaryField
-            width: parent.width
-            placeholderText: "Add a term, press Enter (e.g. Kowalczyk)"
-            foreground: root.bar.foreground
-            accent: Color.accent
-            font.family: root.bar.fontFamily
-            onAccepted: {
-              var t = text.trim()
-              if (t === "") return
-              var list = root.glossaryPhrases.slice()
-              if (list.indexOf(t) < 0) list.push(t)
-              root.glossaryPhrases = list
-              text = ""
-              root.applySettings({ "glossary": { "enabled": root.glossaryEnabled, "phrases": root.glossaryPhrases, "boost": root.glossaryBoost } })
-            }
-          }
+              Toggle {
+                width: parent.width
+                label: "Multimedia mode"
+                description: "For videos/voice messages: longer end-of-utterance window so continuous speech is segmented into cards"
+                checked: root.multimedia
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.multimedia = !root.multimedia
+                  root.applySettings({ "multimedia": root.multimedia })
+                }
+              }
 
-          Flow {
-            width: parent.width
-            spacing: Style.space(6)
-            visible: root.glossaryPhrases.length > 0
+              Toggle {
+                width: parent.width
+                visible: root.multimedia
+                label: "Ignore silence"
+                description: "Mute the monitor while it stays quiet so idle speaker noise can't produce phantom translations"
+                checked: root.gateEnabled
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.gateEnabled = !root.gateEnabled
+                  root.applySettings({ "gate": { "enabled": root.gateEnabled } })
+                }
+              }
 
-            Repeater {
-              model: root.glossaryPhrases
+              Column {
+                width: parent.width
+                spacing: Style.space(6)
+                visible: root.multimedia
 
-              Rectangle {
-                required property var modelData
-                width: chipRow.implicitWidth + Style.space(16)
-                height: Style.space(26)
-                radius: Style.cornerRadius
-                color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+                Text {
+                  width: parent.width
+                  text: "Minimum speech level"
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                }
 
                 Row {
-                  id: chipRow
-                  anchors.centerIn: parent
-                  spacing: Style.space(8)
+                  id: gateRow
+                  width: parent.width
+                  spacing: Style.space(10)
 
-                  Text {
-                    text: modelData
-                    color: root.bar.foreground
-                    font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    anchors.verticalCenter: parent.verticalCenter
+                  Button {
+                    id: gateDown
+                    text: "−"
+                    iconText: ""
+                    bordered: true
+                    foreground: root.bar.foreground
+                    accent: Color.accent
+                    fontFamily: root.bar.fontFamily
+                    onClicked: root.bumpGate(-20)
                   }
 
-                  Text {
-                    text: "✕"
-                    color: Qt.darker(root.bar.foreground, 1.4)
+                  TextField {
+                    id: gateField
+                    width: parent.width - gateDown.implicitWidth - gateUp.implicitWidth - Style.space(10) * 2
+                    text: String(Math.round(root.gateOpenRms))
+                    foreground: root.bar.foreground
+                    accent: Color.accent
                     font.family: root.bar.fontFamily
-                    font.pixelSize: Style.font.bodySmall
-                    anchors.verticalCenter: parent.verticalCenter
+                    onAccepted: {
+                      var v = Number(text.replace(/[^0-9]/g, ""))
+                      if (isNaN(v) || v <= 0) { text = String(Math.round(root.gateOpenRms)); return }
+                      root.gateOpenRms = v
+                      root.applySettings({ "gate": { "open_rms": v } })
+                    }
+                  }
 
-                    MouseArea {
-                      anchors.fill: parent
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: {
-                        var list = root.glossaryPhrases.slice()
-                        var i = list.indexOf(modelData)
-                        if (i >= 0) list.splice(i, 1)
-                        root.glossaryPhrases = list
-                        root.applySettings({ "glossary": { "enabled": root.glossaryEnabled, "phrases": root.glossaryPhrases, "boost": root.glossaryBoost } })
+                  Button {
+                    id: gateUp
+                    text: "+"
+                    iconText: ""
+                    bordered: true
+                    foreground: root.bar.foreground
+                    accent: Color.accent
+                    fontFamily: root.bar.fontFamily
+                    onClicked: root.bumpGate(20)
+                  }
+                }
+
+                Text {
+                  width: parent.width
+                  text: "Suggested range 50–2000 (default 200). Higher = only louder audio is translated. Lower = more sensitive to quiet speech."
+                  color: Qt.darker(root.bar.foreground, 1.5)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Two-tier accuracy"
+                description: "Re-transcribe each finished phrase with a more accurate offline model (Parakeet) and replace the text in place"
+                checked: root.twoTier
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.twoTier = !root.twoTier
+                  root.applySettings({ "two_tier": root.twoTier })
+                }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Translation history"
+                description: "ON: keep all cards (scrollable). OFF: show only the newest card."
+                checked: root.history
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.history = !root.history
+                  root.applySettings({ "history": root.history })
+                }
+              }
+            }
+          }
+
+          // ---- glossary --------------------------------------------------
+          Rectangle {
+            width: parent.width
+            implicitHeight: glossaryCol.implicitHeight + Style.space(12) * 2
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.themeGreen.r, root.themeGreen.g, root.themeGreen.b, 0.04)
+            border.color: Qt.rgba(root.themeGreen.r, root.themeGreen.g, root.themeGreen.b, 0.35)
+            border.width: 1
+
+            Column {
+              id: glossaryCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(12)
+              spacing: Style.space(8)
+
+              PanelSectionHeader { text: "GLOSSARY"; foreground: root.themeGreen; fontSize: Style.font.body }
+
+              Toggle {
+                width: parent.width
+                label: "Word boosting"
+                description: "Bias recognition toward names and terms you add below"
+                checked: root.glossaryEnabled
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.glossaryEnabled = !root.glossaryEnabled
+                  root.applySettings({ "glossary": { "enabled": root.glossaryEnabled, "phrases": root.glossaryPhrases, "boost": root.glossaryBoost } })
+                }
+              }
+
+              TextField {
+                id: glossaryField
+                width: parent.width
+                placeholderText: "Add a term, press Enter (e.g. Kowalczyk)"
+                foreground: root.bar.foreground
+                accent: Color.accent
+                font.family: root.bar.fontFamily
+                onAccepted: {
+                  var t = text.trim()
+                  if (t === "") return
+                  var list = root.glossaryPhrases.slice()
+                  if (list.indexOf(t) < 0) list.push(t)
+                  root.glossaryPhrases = list
+                  text = ""
+                  root.applySettings({ "glossary": { "enabled": root.glossaryEnabled, "phrases": root.glossaryPhrases, "boost": root.glossaryBoost } })
+                }
+              }
+
+              Flow {
+                width: parent.width
+                spacing: Style.space(6)
+                visible: root.glossaryPhrases.length > 0
+
+                Repeater {
+                  model: root.glossaryPhrases
+
+                  Rectangle {
+                    required property var modelData
+                    width: chipRow.implicitWidth + Style.space(16)
+                    height: Style.space(26)
+                    radius: Style.cornerRadius
+                    color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+
+                    Row {
+                      id: chipRow
+                      anchors.centerIn: parent
+                      spacing: Style.space(8)
+
+                      Text {
+                        text: modelData
+                        color: root.bar.foreground
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        anchors.verticalCenter: parent.verticalCenter
+                      }
+
+                      Text {
+                        text: "✕"
+                        color: Qt.darker(root.bar.foreground, 1.4)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        anchors.verticalCenter: parent.verticalCenter
+
+                        MouseArea {
+                          anchors.fill: parent
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: {
+                            var list = root.glossaryPhrases.slice()
+                            var i = list.indexOf(modelData)
+                            if (i >= 0) list.splice(i, 1)
+                            root.glossaryPhrases = list
+                            root.applySettings({ "glossary": { "enabled": root.glossaryEnabled, "phrases": root.glossaryPhrases, "boost": root.glossaryBoost } })
+                          }
+                        }
                       }
                     }
                   }
@@ -583,138 +716,185 @@ Panel {
             }
           }
 
-          PanelSeparator {}
-
           // ---- activation -------------------------------------------------
-          PanelSectionHeader { text: "ACTIVATION"; foreground: root.themeAccent }
-
-          Toggle {
+          Rectangle {
             width: parent.width
-            label: "Only translate in the call app"
-            description: "Pause when the focused window isn't your call app"
-            checked: root.activationEnabled
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.activationEnabled = !root.activationEnabled
-              root.applySettings({ "activation": { "enabled": root.activationEnabled, "app_class": root.activationClass, "app_title": root.activationTitle } })
+            implicitHeight: activationCol.implicitHeight + Style.space(12) * 2
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.04)
+            border.color: Qt.rgba(root.themeAccent.r, root.themeAccent.g, root.themeAccent.b, 0.35)
+            border.width: 1
+
+            Column {
+              id: activationCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(12)
+              spacing: Style.space(8)
+
+              PanelSectionHeader { text: "ACTIVATION"; foreground: root.themeAccent; fontSize: Style.font.body }
+
+              Toggle {
+                width: parent.width
+                label: "Only translate in the call app"
+                description: "Pause when the focused window isn't your call app"
+                checked: root.activationEnabled
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.activationEnabled = !root.activationEnabled
+                  root.applySettings({ "activation": { "enabled": root.activationEnabled, "app_class": root.activationClass, "app_title": root.activationTitle } })
+                }
+              }
+
+              TextField {
+                id: activationField
+                width: parent.width
+                placeholderText: "Window class (e.g. zoom, teams, discord)"
+                text: root.activationClass
+                foreground: root.bar.foreground
+                accent: Color.accent
+                font.family: root.bar.fontFamily
+                onEditingFinished: {
+                  root.activationClass = text.trim()
+                  root.applySettings({ "activation": { "enabled": root.activationEnabled, "app_class": root.activationClass, "app_title": root.activationTitle } })
+                }
+              }
             }
           }
-
-          TextField {
-            id: activationField
-            width: parent.width
-            placeholderText: "Window class (e.g. zoom, teams, discord)"
-            text: root.activationClass
-            foreground: root.bar.foreground
-            accent: Color.accent
-            font.family: root.bar.fontFamily
-            onEditingFinished: {
-              root.activationClass = text.trim()
-              root.applySettings({ "activation": { "enabled": root.activationEnabled, "app_class": root.activationClass, "app_title": root.activationTitle } })
-            }
-          }
-
-          PanelSeparator {}
 
           // ---- diagnostics ------------------------------------------------
-          PanelSectionHeader { text: "DIAGNOSTICS"; foreground: root.themeGreen }
-
-          Toggle {
+          Rectangle {
             width: parent.width
-            label: "Save all audio transcripts"
-            description: "Store full transcript text and audio in logs/WAVs (for debugging). OFF keeps only timing metadata for privacy."
-            checked: root.debugCapture
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.debugCapture = !root.debugCapture
-              root.applySettings({ "debug_capture": root.debugCapture })
+            implicitHeight: diagCol.implicitHeight + Style.space(12) * 2
+            radius: Style.cornerRadius
+            color: Qt.rgba(root.themeGreen.r, root.themeGreen.g, root.themeGreen.b, 0.04)
+            border.color: Qt.rgba(root.themeGreen.r, root.themeGreen.g, root.themeGreen.b, 0.35)
+            border.width: 1
+
+            Column {
+              id: diagCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              anchors.margins: Style.space(12)
+              spacing: Style.space(8)
+
+              PanelSectionHeader { text: "DIAGNOSTICS"; foreground: root.themeGreen; fontSize: Style.font.body }
+
+              Toggle {
+                width: parent.width
+                label: "Save all audio transcripts"
+                description: "Store full transcript text and audio in logs/WAVs (for debugging). OFF keeps only timing metadata for privacy."
+                checked: root.debugCapture
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.debugCapture = !root.debugCapture
+                  root.applySettings({ "debug_capture": root.debugCapture })
+                }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Log clipboard text"
+                description: "Include clipboard source and translation text in logs. OFF logs only character counts for privacy."
+                checked: root.clipboardLogText
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.clipboardLogText = !root.clipboardLogText
+                  root.applySettings({ "clipboard_log_text": root.clipboardLogText })
+                }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Audio cleanup"
+                description: "High-pass filter + gain boost before recognition (helps quiet or muffled audio)"
+                checked: root.preprocess
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.preprocess = !root.preprocess
+                  root.applySettings({ "preprocess_enable": root.preprocess })
+                }
+              }
+
+              Toggle {
+                width: parent.width
+                label: "Keep screen awake"
+                description: "Suppress the screensaver and lock while the translator is running"
+                checked: root.keepAwake
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: {
+                  root.keepAwake = !root.keepAwake
+                  root.applySettings({ "keep_awake": root.keepAwake })
+                }
+              }
+
+              Button {
+                width: parent.width
+                text: "Open diagnostics"
+                iconText: "\uf188"
+                bordered: true
+                foreground: root.bar.foreground
+                accent: Color.accent
+                fontFamily: root.bar.fontFamily
+                onClicked: root.copyDiagnostics()
+              }
+
+              Text {
+                width: parent.width
+                text: "Opens a terminal with service state, controller status, recent logs, and engine info."
+                color: Qt.darker(root.bar.foreground, 1.5)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              Button {
+                width: parent.width
+                text: "Clear logs & history"
+                iconText: "\uf1f8"
+                bordered: true
+                foreground: Color.urgent
+                accent: Color.urgent
+                fontFamily: root.bar.fontFamily
+                onClicked: root.clearLogs()
+              }
+
+              Text {
+                width: parent.width
+                text: "Deletes all log files, translation history, debug captures, and clears the overlay."
+                color: Qt.darker(root.bar.foreground, 1.5)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
             }
           }
+        }
 
-          Toggle {
-            width: parent.width
-            label: "Log clipboard text"
-            description: "Include clipboard source and translation text in logs. OFF logs only character counts for privacy."
-            checked: root.clipboardLogText
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.clipboardLogText = !root.clipboardLogText
-              root.applySettings({ "clipboard_log_text": root.clipboardLogText })
-            }
-          }
-
-          Toggle {
-            width: parent.width
-            label: "Audio cleanup"
-            description: "High-pass filter + gain boost before recognition (helps quiet or muffled audio)"
-            checked: root.preprocess
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.preprocess = !root.preprocess
-              root.applySettings({ "preprocess_enable": root.preprocess })
-            }
-          }
-
-          Toggle {
-            width: parent.width
-            label: "Keep screen awake"
-            description: "Suppress the screensaver and lock while the translator is running"
-            checked: root.keepAwake
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: {
-              root.keepAwake = !root.keepAwake
-              root.applySettings({ "keep_awake": root.keepAwake })
-            }
-          }
-
-          Button {
-            width: parent.width
-            text: "Open diagnostics"
-            iconText: "\uf188"
-            bordered: true
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: root.copyDiagnostics()
-          }
-
-          Text {
-            width: parent.width
-            text: "Opens a terminal with service state, controller status, recent logs, and engine info."
-            color: Qt.darker(root.bar.foreground, 1.5)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
-          }
-
-          Button {
-            width: parent.width
-            text: "Clear logs & history"
-            iconText: "\uf1f8"
-            bordered: true
-            foreground: Color.urgent
-            accent: Color.urgent
-            fontFamily: root.bar.fontFamily
-            onClicked: root.clearLogs()
-          }
-
-          Text {
-            width: parent.width
-            text: "Deletes all log files, translation history, debug captures, and clears the overlay."
-            color: Qt.darker(root.bar.foreground, 1.5)
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+        // Speed up trackpad scrolling 3x (core QtQuick only). Declared after the
+        // Column so it sits on top and receives wheel events first; no accepted
+        // buttons means clicks pass through to the controls below.
+        MouseArea {
+          anchors.fill: parent
+          acceptedButtons: Qt.NoButton
+          hoverEnabled: true
+          onWheel: {
+            var max = Math.max(0, settingsScroll.contentHeight - settingsScroll.height)
+            settingsScroll.contentY = Math.max(0, Math.min(max, settingsScroll.contentY - wheel.angleDelta.y * 1.5))
           }
         }
       }

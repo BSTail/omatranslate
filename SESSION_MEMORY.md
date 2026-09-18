@@ -145,6 +145,15 @@ Offline bilingual (en↔es) live speech-translation plugin for Omarchy Linux
     a fresh `incoming started` with the current gen.
 
 ## Current investigation / next up (user's priority, 2026-09-15)
+- **Immediate vs 55s wire-idle fresh-socket ABBA completed, 2026-09-16 13:27:**
+  order immediate-idle-idle-immediate with identical `in-85` PCM. First-delta
+  mean immediate4.417s vs idle4.384s; final mean immediate18.965s vs
+  idle18.943s. Every run's first nonempty delta was `Me` at
+  audio_processed4.48; final transcript and audio_processed18.96 were identical;
+  exactly one final each; no errors/aborts. Controller PID1817452, NeMo
+  PID1817460, NRestarts0 stable. Conclusion: 55s fresh-socket wire idle has no
+  adverse latency/opening effect and does not explain the natural first-play
+  delay. Evidence: `/tmp/opencode/fresh-ws-idle-abba-20260916-132309/`.
 - **Fixed-WAV fresh-WebSocket ABBA completed, 2026-09-16 12:35:** order A-B-B-A.
   A sent after `session.updated`; B ran the deployed 1.6s tone + 1.6s silence
   warmup, observed inference proof, then clear acknowledgement before speech.
